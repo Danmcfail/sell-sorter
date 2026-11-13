@@ -1,0 +1,24 @@
+workflows:
+  android-release:
+    name: Sell Sorter Android APK
+    # Mac mini M2 uses the free plan's 500 build minutes a month.
+    # If Codemagic rejects this line, delete it and pick
+    # Mac mini M2 in the workflow's Machine settings on the website.
+    instance_type: mac_mini_m2
+    environment:
+      flutter: 3.19.6
+    triggering:
+      events:
+        - push
+    cache:
+      cache_paths:
+        - ~/.pub-cache
+    scripts:
+      - name: Make gradlew executable
+        script: chmod +x android/gradlew
+      - name: Get packages
+        script: flutter pub get
+      - name: Build release APK
+        script: flutter build apk --release
+    artifacts:
+      - build/app/outputs/flutter-apk/app-release.apk
