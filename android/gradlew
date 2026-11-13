@@ -1,0 +1,13 @@
+#!/bin/sh
+# Sell Sorter: minimal Gradle launcher (no wrapper jar in the repo).
+# Downloads Gradle 7.5 once, then runs it with whatever Flutter passes.
+set -e
+GRADLE_VERSION=7.5
+GRADLE_HOME="$HOME/.sell-sorter-gradle/gradle-$GRADLE_VERSION"
+if [ ! -x "$GRADLE_HOME/bin/gradle" ]; then
+  mkdir -p "$HOME/.sell-sorter-gradle"
+  (cd "$HOME/.sell-sorter-gradle" && \
+    curl -L -o "gradle-$GRADLE_VERSION-bin.zip" "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" && \
+    unzip -q -o "gradle-$GRADLE_VERSION-bin.zip")
+fi
+exec "$GRADLE_HOME/bin/gradle" "$@"
