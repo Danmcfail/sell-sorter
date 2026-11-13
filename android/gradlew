@@ -1,8 +1,9 @@
 #!/bin/sh
 # Sell Sorter: minimal Gradle launcher (no wrapper jar in the repo).
-# Downloads Gradle 7.5 once, then runs it with whatever Flutter passes.
+# Downloads Gradle 8.3 once, then runs it with whatever Flutter passes.
+# Must match gradle-wrapper.properties (AGP 8.1.0 needs Gradle 8.0+).
 set -e
-GRADLE_VERSION=7.5
+GRADLE_VERSION=8.3
 GRADLE_HOME="$HOME/.sell-sorter-gradle/gradle-$GRADLE_VERSION"
 if [ ! -x "$GRADLE_HOME/bin/gradle" ]; then
   mkdir -p "$HOME/.sell-sorter-gradle"
