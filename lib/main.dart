@@ -112,7 +112,7 @@ class _HomePageState extends State<HomePage> {
   // ---------- picking ----------
 
   Future<void> _pickPhotos() async {
-    final files = await ImagePicker().pickMultipleImages();
+    final files = await ImagePicker().pickMultiImage();
     if (files.isEmpty) return;
     setState(() {
       for (final f in files) {
@@ -142,7 +142,13 @@ class _HomePageState extends State<HomePage> {
           for (final a in albums)
             SimpleDialogOption(
               onPressed: () => Navigator.pop(ctx, a),
-              child: Text('${a.name} (${a.assetCount})'),
+              child: FutureBuilder<int>(
+                future: a.assetCountAsync,
+                builder: (context, snapshot) {
+                  final count = snapshot.data;
+                  return Text(count == null ? a.name : '${a.name} ($count)');
+                },
+              ),
             ),
         ],
       ),
