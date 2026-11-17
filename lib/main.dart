@@ -49,6 +49,7 @@
 //    (see README.md). The first build is the test — send any build
 //    error back and it can be fixed.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
