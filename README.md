@@ -10,7 +10,12 @@ only copies.
 
 1. **Pick photos** — choose a bunch by hand.
    **Pick a phone folder** — choose one album on the phone.
-   **Scan all photos** — loads every photo on the phone.
+   **Scan all photos** — one tap runs the whole job (scan -> sort ->
+   save) in the background. A notification shows live progress
+   ("Scanning 1,234 / 8,000"). You can lock the phone, use other
+   apps, or close the app — the scan keeps going. Open the app any
+   time to see the same progress. If a run gets interrupted it
+   resumes where it stopped instead of starting over.
 2. **Sort photos** — on-device ML Kit (nothing is sent anywhere):
    - Face detection + person labels: a photo with people in it is a family
      photo, not a selling photo. It is skipped and gets no folder.
@@ -46,6 +51,10 @@ only copies.
 - Labels are generic ("hammer" may come out as "tool"). Rename with one tap.
 - Two different items that look alike (two plain shirts, same colour) may
   land in one folder. Long-press to move the odd ones out.
+- Samsung phones try to kill background apps to save battery. The first
+  time you tap **Scan all photos**, the app asks to run without battery
+  limits — allow it. If a scan ever stops when the app is closed, check
+  Settings > Apps > Sell Sorter > Battery > Unrestricted.
 
 ## How to build it — Samsung version (Codemagic, no laptop needed)
 
