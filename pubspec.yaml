@@ -18,6 +18,10 @@ dependencies:
   image_picker: ^1.0.0
   path_provider: ^2.0.0
   photo_manager: ^3.0.0
+  # 8.17.0 is the newest version that builds with Flutter 3.19.6
+  # (9.0.0+ needs Flutter 3.22 / Dart 3.4). Runs the scan in a
+  # foreground service so it keeps going with the screen off.
+  flutter_foreground_task: ^8.17.0
 
 dev_dependencies:
   flutter_lints: ^3.0.0
