@@ -30,8 +30,16 @@
 // see the same progress. If the phone is a Samsung and the scan stops
 // when the app is closed, allow Sell Sorter to run without battery
 // limits (Settings > Apps > Sell Sorter > Battery > Unrestricted).
-// A run that gets interrupted resumes where it stopped instead of
-// starting over.
+//
+// The scan never starts over. Every photo it finishes is written
+// into a permanent done-record (sell_sorter_done.jsonl) that is kept
+// between runs, and its copy is put into its Sell folder right away —
+// the folders build up while the scan runs, so an interrupted run
+// loses nothing. The next run skips every photo already in the
+// record (the progress shows how many were skipped, e.g. "5,000
+// already sorted") and only analyzes the new ones. If a saved copy
+// was deleted from a Sell folder, the next run copies it again
+// instead of re-analyzing the photo.
 //
 // Honest limits (read this before you build):
 //  - The app can only see photos ON the phone. It cannot reach into
@@ -93,37 +101,52 @@ class SellSorterApp extends StatelessWidget {
 }
 
 /// One analyzed photo, as plain data (safe to send between isolates).
+///
+/// [id] is the stable key the done-record uses to remember this photo
+/// between runs: the photo library's asset id when known, otherwise
+/// the file path. [savedTo] is where its copy sits in the Sell
+/// folders (null until it is copied, and null again if that copy goes
+/// missing). Both change as the sort runs, so they are not final —
+/// the label, brightness, blur, colour and poor/skipped flags are the
+/// analysis itself and never change once written.
 class AnalyzedPhoto {
   AnalyzedPhoto({
     required this.path,
+    String? id,
     this.label = 'Unsorted',
     this.brightness = 128,
     this.blur = 9999,
     this.color = const [128, 128, 128],
     this.poor = false,
     this.skipped = false,
-  });
+    this.savedTo,
+  }) : id = id ?? path;
 
   final String path;
+  String id;
   final String label; // ML Kit top label, or 'Unsorted'.
   final double brightness; // Mean luminance, 0-255.
   final double blur; // Laplacian variance; low = blurry.
   final List<int> color; // Average red, green, blue.
   final bool poor;
   final bool skipped; // True when a person is in the photo.
+  String? savedTo; // Destination copy, or null when not saved yet.
 
   Map<String, dynamic> toJson() => {
         'path': path,
+        'id': id,
         'label': label,
         'brightness': brightness,
         'blur': blur,
         'color': color,
         'poor': poor,
         'skipped': skipped,
+        'savedTo': savedTo,
       };
 
   factory AnalyzedPhoto.fromJson(Map<String, dynamic> j) => AnalyzedPhoto(
         path: j['path'] as String,
+        id: j['id'] as String?,
         label: j['label'] as String? ?? 'Unsorted',
         brightness: (j['brightness'] as num?)?.toDouble() ?? 128,
         blur: (j['blur'] as num?)?.toDouble() ?? 9999,
@@ -133,7 +156,24 @@ class AnalyzedPhoto {
             const [128, 128, 128],
         poor: j['poor'] as bool? ?? false,
         skipped: j['skipped'] as bool? ?? false,
+        savedTo: j['savedTo'] as String?,
       );
+}
+
+/// One photo handed to the sort: its file path, plus the photo
+/// library's stable id for it when the caller knows it (photo_manager
+/// asset id). The id — not the file path — is the key the done-record
+/// uses, because photo_manager may hand back a different cached path
+/// for the same photo on another run. Picked photos have no library
+/// id, so the path is the key there.
+class PhotoRef {
+  const PhotoRef(this.path, [this.id]);
+
+  final String path;
+  final String? id;
+
+  /// The key used to remember this photo between runs.
+  String get key => id ?? path;
 }
 
 /// One item's folder, as plain data (safe to send between isolates).
@@ -354,8 +394,9 @@ Future<({double brightness, double blur, List<int> color})> _analyzeBytes(
 Future<AnalyzedPhoto> _analyzeOne(
   String path,
   ImageLabeler labeler,
-  FaceDetector faceDetector,
-) async {
+  FaceDetector faceDetector, {
+  String? id,
+}) async {
   bool hasPerson = false;
   List<ImageLabel> labels = [];
   try {
@@ -369,7 +410,7 @@ Future<AnalyzedPhoto> _analyzeOne(
   } catch (_) {
     // If detection fails, fall through and label it normally.
   }
-  if (hasPerson) return AnalyzedPhoto(path: path, skipped: true);
+  if (hasPerson) return AnalyzedPhoto(path: path, id: id, skipped: true);
   String label = 'Unsorted';
   if (labels.isNotEmpty) {
     labels.sort((a, b) => b.confidence.compareTo(a.confidence));
@@ -382,6 +423,7 @@ Future<AnalyzedPhoto> _analyzeOne(
       info.brightness < 35 || info.brightness > 245 || info.blur < 30;
   return AnalyzedPhoto(
     path: path,
+    id: id,
     label: label,
     brightness: info.brightness,
     blur: info.blur,
@@ -440,121 +482,356 @@ List<GroupData> _buildGroups(List<AnalyzedPhoto> photos) {
   return groups;
 }
 
+/// One item folder's fingerprint: its name, plus its photos in order,
+/// good and poor split. If the fingerprint is the same as last flush,
+/// no photo in that folder can have moved, so the folder is skipped
+/// without touching the files. That is what keeps the incremental
+/// save cheap — only folders that actually changed get file checks.
+String _groupSignature(GroupData g) {
+  final buf = StringBuffer(g.name);
+  buf.write('|G');
+  for (final p in g.good) {
+    buf.write(',');
+    buf.write(p.id);
+  }
+  buf.write('|P');
+  for (final p in g.poor) {
+    buf.write(',');
+    buf.write(p.id);
+  }
+  return buf.toString();
+}
+
+/// Copies one photo to its place in a Sell folder. Returns true when
+/// the saved copy changed (new copy, or moved to a new place), so the
+/// caller can write the new destination into the done-record.
+Future<bool> _copyOne(
+  AnalyzedPhoto photo,
+  String destPath,
+) async {
+  // Already copied to exactly this place, and the copy is still
+  // there? Leave it alone — no duplicate copies, no re-copying.
+  if (photo.savedTo == destPath) {
+    try {
+      if (await File(destPath).exists()) return false;
+    } catch (_) {}
+    // The copy went missing — copy it again below.
+  }
+  try {
+    await File(photo.path).copy(destPath);
+  } catch (_) {
+    // The original is gone (deleted from the phone) — nothing to
+    // copy. Leave savedTo alone; the next run will try again.
+    return false;
+  }
+  if (photo.savedTo != destPath) {
+    photo.savedTo = destPath;
+    return true;
+  }
+  return false;
+}
+
 /// Copies grouped photos into Sell/<Item>/ and Sell/<Item>/Poor/.
-/// Copies only — originals are never touched. Returns the Sell folder.
-Future<String> _saveGroups(List<GroupData> groups, Directory docs) async {
+/// Copies only — originals are never touched.
+///
+/// Incremental and safe to call again and again, which is how the
+/// folders build up while a scan runs: a photo whose copy already
+/// sits where it belongs is left alone; a photo whose copy went
+/// missing is copied again; a photo that moved (different folder, or
+/// a different number because a sharper shot arrived) has its old
+/// copy removed first, then is copied to its new place. When
+/// [prevSignatures] is given, folders whose fingerprint has not
+/// changed since the last call are skipped outright; pass null for a
+/// full verification pass. Returns the Sell folder path and the
+/// photos whose saved copy changed.
+Future<({String savePath, List<AnalyzedPhoto> changed})> _saveGroups(
+  List<GroupData> groups,
+  Directory docs, {
+  Map<String, String>? prevSignatures,
+}) async {
   final root = Directory('${docs.path}/Sell');
+  final changed = <AnalyzedPhoto>[];
+  // Pass 1 — remove copies of photos that moved away. Done before
+  // any copying, so a copy is never deleted after another photo has
+  // taken its file name.
   for (final g in groups) {
+    final sig = _groupSignature(g);
+    if (prevSignatures != null && prevSignatures[g.name] == sig) {
+      continue;
+    }
+    final dir = Directory('${root.path}/${g.name}');
+    final poorDir = Directory('${dir.path}/Poor');
+    final slug = _slug(g.name);
+    for (var i = 0; i < g.good.length; i++) {
+      final p = g.good[i];
+      final dest =
+          '${dir.path}/${slug}_${(i + 1).toString().padLeft(2, '0')}.${_ext(p.path)}';
+      if (p.savedTo != null && p.savedTo != dest) {
+        try {
+          final old = File(p.savedTo!);
+          if (await old.exists()) await old.delete();
+        } catch (_) {}
+      }
+    }
+    for (var i = 0; i < g.poor.length; i++) {
+      final p = g.poor[i];
+      final dest =
+          '${poorDir.path}/${slug}_${(i + 1).toString().padLeft(2, '0')}.${_ext(p.path)}';
+      if (p.savedTo != null && p.savedTo != dest) {
+        try {
+          final old = File(p.savedTo!);
+          if (await old.exists()) await old.delete();
+        } catch (_) {}
+      }
+    }
+  }
+  // Pass 2 — copy anything that is new, moved, or missing.
+  for (final g in groups) {
+    final sig = _groupSignature(g);
+    final unchanged =
+        prevSignatures != null && prevSignatures[g.name] == sig;
+    if (prevSignatures != null) prevSignatures[g.name] = sig;
+    if (unchanged) continue;
     final dir = Directory('${root.path}/${g.name}');
     final poorDir = Directory('${dir.path}/Poor');
     await dir.create(recursive: true);
     if (g.poor.isNotEmpty) await poorDir.create(recursive: true);
     final slug = _slug(g.name);
     for (var i = 0; i < g.good.length; i++) {
-      final dest = File(
-        '${dir.path}/${slug}_${(i + 1).toString().padLeft(2, '0')}.${_ext(g.good[i].path)}',
-      );
-      if (await dest.exists()) await dest.delete();
-      await File(g.good[i].path).copy(dest.path);
+      final p = g.good[i];
+      final dest =
+          '${dir.path}/${slug}_${(i + 1).toString().padLeft(2, '0')}.${_ext(p.path)}';
+      if (await _copyOne(p, dest)) changed.add(p);
     }
     for (var i = 0; i < g.poor.length; i++) {
-      final dest = File(
-        '${poorDir.path}/${slug}_${(i + 1).toString().padLeft(2, '0')}.${_ext(g.poor[i].path)}',
-      );
-      if (await dest.exists()) await dest.delete();
-      await File(g.poor[i].path).copy(dest.path);
+      final p = g.poor[i];
+      final dest =
+          '${poorDir.path}/${slug}_${(i + 1).toString().padLeft(2, '0')}.${_ext(p.path)}';
+      if (await _copyOne(p, dest)) changed.add(p);
     }
   }
-  return root.path;
+  return (savePath: root.path, changed: changed);
 }
 
 /// The whole sort, usable from the app screen and from the background
-/// service alike: analyzes [paths], groups them, and (unless [save] is
-/// false) saves the folders.
+/// service alike: analyzes [photos], groups them, and (unless [save]
+/// is false) saves the folders as it goes.
 ///
-/// A run that gets interrupted leaves a checkpoint file behind, so the
-/// next run skips the photos it already analyzed instead of starting
-/// over. The checkpoint is deleted only after a successful save.
-Future<({List<GroupData> groups, int skipped, String savePath})>
+/// The run never starts over. Every photo it finishes is written
+/// into a permanent done-record (sell_sorter_done.jsonl) that is kept
+/// between runs — it is never deleted. A new run loads the record and
+/// skips every photo already in it, as long as its copy still sits in
+/// its Sell folder; a photo whose copy went missing is copied again
+/// instead of being re-analyzed. With [save] on, each analyzed photo
+/// is copied into its Sell folder right away (in small batches), so
+/// the folders build up during the run and survive an interruption.
+/// A run that gets interrupted leaves the record and the folders
+/// behind, so the next run picks up where it stopped. One damaged
+/// line in the record is ignored; a run only starts over if the whole
+/// record cannot be read at all.
+///
+/// [onProgress] reports (done, total, familySkipped, alreadyDone):
+/// how many photos are analyzed so far, how many there are in total,
+/// how many are family photos, and how many were skipped because
+/// they were already sorted in an earlier run.
+Future<({List<GroupData> groups, int skipped, String savePath, int alreadyDone})>
     runSortPipeline({
-  required List<String> paths,
-  required Future<void> Function(int done, int total, int skipped)
+  required List<PhotoRef> photos,
+  required Future<void> Function(
+          int done, int total, int skipped, int alreadyDone)
       onProgress,
   bool save = true,
 }) async {
   final docs = await getApplicationDocumentsDirectory();
-  final checkpoint = File('${docs.path}/sell_sorter_checkpoint.jsonl');
+  // The permanent done-record. An older build kept the same records
+  // under the checkpoint name — that file is adopted too, so
+  // upgrading does not make the next run start over.
+  final record = File('${docs.path}/sell_sorter_done.jsonl');
+  final oldCheckpoint =
+      File('${docs.path}/sell_sorter_checkpoint.jsonl');
   final Map<String, AnalyzedPhoto> done = {};
-  if (await checkpoint.exists()) {
+  final Map<String, AnalyzedPhoto> byPath = {};
+  Future<void> loadRecord(File file) async {
+    if (!await file.exists()) return;
     try {
-      for (final line in await checkpoint.readAsLines()) {
+      for (final line in await file.readAsLines()) {
         if (line.trim().isEmpty) continue;
-        final photo = AnalyzedPhoto.fromJson(
-            (jsonDecode(line) as Map).cast<String, dynamic>());
-        done[photo.path] = photo;
+        try {
+          final photo = AnalyzedPhoto.fromJson(
+              (jsonDecode(line) as Map).cast<String, dynamic>());
+          done[photo.id] = photo;
+          byPath[photo.path] = photo;
+        } catch (_) {
+          // One damaged line is ignored; the rest still load.
+        }
       }
     } catch (_) {
-      // A damaged checkpoint is ignored — the run just starts over.
-      done.clear();
+      // This file cannot be read at all — its records are skipped.
     }
   }
-  // Only records for photos in this run count.
-  final wanted = paths.toSet();
-  done.removeWhere((path, _) => !wanted.contains(path));
 
-  var skipped = done.values.where((p) => p.skipped).length;
-  var processed = done.length;
-  await onProgress(processed, paths.length, skipped);
+  await loadRecord(oldCheckpoint);
+  await loadRecord(record);
+  // One record per photo: if the same file was recorded twice (once
+  // by path, once by library id), keep the newest line for it.
+  final Map<String, AnalyzedPhoto> unique = {};
+  for (final photo in byPath.values) {
+    unique[photo.path] = photo;
+  }
+  done.clear();
+  byPath.clear();
+  for (final photo in unique.values) {
+    done[photo.id] = photo;
+    byPath[photo.path] = photo;
+  }
 
-  if (processed < paths.length) {
-    final labeler = ImageLabeler(
-      options: ImageLabelerOptions(confidenceThreshold: 0.5),
-    );
-    final faceDetector = FaceDetector(
-      options: FaceDetectorOptions(
-        enableClassification: false,
-        enableTracking: false,
-        minFaceSize: 0.1,
-      ),
-    );
-    final sink = checkpoint.openWrite(mode: FileMode.append);
-    var sinceFlush = 0;
+  // Only the photos in this run are sorted now, but the record keeps
+  // every photo from every run — a picked-photos run must never wipe
+  // the record of a full scan.
+  final runPhotos = <AnalyzedPhoto>[];
+  var alreadyDone = 0;
+  for (final ref in photos) {
+    var photo = done[ref.key] ?? byPath[ref.path];
+    if (photo == null) continue;
+    if (photo.id != ref.key) {
+      // Same photo, now known by its library id — move the record
+      // over to the stable key.
+      done.remove(photo.id);
+      photo.id = ref.key;
+      done[ref.key] = photo;
+    }
+    if (!runPhotos.contains(photo)) runPhotos.add(photo);
+  }
+  // A photo only counts as already sorted when its copy is still in
+  // its Sell folder. A missing copy is re-copied at the next save
+  // flush instead of being analyzed again.
+  for (final photo in runPhotos) {
+    if (photo.skipped) {
+      alreadyDone++;
+      continue;
+    }
+    if (photo.savedTo == null) continue;
     try {
-      for (final path in paths) {
-        if (done.containsKey(path)) continue;
-        AnalyzedPhoto? photo;
-        try {
-          photo = await _analyzeOne(path, labeler, faceDetector);
-        } catch (_) {
-          photo = null; // Unreadable photo — skip it, keep going.
-        }
-        if (photo != null) {
-          done[path] = photo;
-          if (photo.skipped) skipped++;
-          sink.writeln(jsonEncode(photo.toJson()));
-          if (++sinceFlush >= 50) {
-            await sink.flush();
-            sinceFlush = 0;
-          }
-        }
-        processed++;
-        await onProgress(processed, paths.length, skipped);
+      if (await File(photo.savedTo!).exists()) {
+        alreadyDone++;
+      } else {
+        photo.savedTo = null;
       }
-    } finally {
-      await sink.flush();
-      await sink.close();
-      labeler.close();
-      faceDetector.close();
+    } catch (_) {
+      photo.savedTo = null;
     }
   }
 
-  final groups = _buildGroups(done.values.toList());
-  var savePath = '';
-  if (save) {
-    savePath = await _saveGroups(groups, docs);
-    if (await checkpoint.exists()) await checkpoint.delete();
+  var skipped = runPhotos.where((p) => p.skipped).length;
+  var processed = runPhotos.length;
+  await onProgress(processed, photos.length, skipped, alreadyDone);
+
+  final sink = record.openWrite(mode: FileMode.append);
+  final prevSignatures = <String, String>{};
+  var sinceFlush = 0;
+  // Copies the run's folders so far. Skipped while reviewing
+  // (save: false) — the folders are only saved when the user taps
+  // Save folders.
+  Future<void> flushSave({required bool fullCheck}) async {
+    if (!save) return;
+    final groups = _buildGroups(runPhotos);
+    final result = await _saveGroups(
+      groups,
+      docs,
+      prevSignatures: fullCheck ? null : prevSignatures,
+    );
+    for (final p in result.changed) {
+      sink.writeln(jsonEncode(p.toJson()));
+    }
+    await sink.flush();
   }
-  return (groups: groups, skipped: skipped, savePath: savePath);
+
+  try {
+    if (processed < photos.length) {
+      final labeler = ImageLabeler(
+        options: ImageLabelerOptions(confidenceThreshold: 0.5),
+      );
+      final faceDetector = FaceDetector(
+        options: FaceDetectorOptions(
+          enableClassification: false,
+          enableTracking: false,
+          minFaceSize: 0.1,
+        ),
+      );
+      try {
+        for (final ref in photos) {
+          if (done.containsKey(ref.key) ||
+              byPath.containsKey(ref.path)) {
+            continue;
+          }
+          AnalyzedPhoto? photo;
+          try {
+            photo = await _analyzeOne(
+              ref.path,
+              labeler,
+              faceDetector,
+              id: ref.key,
+            );
+          } catch (_) {
+            photo = null; // Unreadable photo — skip it, keep going.
+          }
+          if (photo != null) {
+            done[ref.key] = photo;
+            byPath[ref.path] = photo;
+            runPhotos.add(photo);
+            if (photo.skipped) skipped++;
+            sink.writeln(jsonEncode(photo.toJson()));
+            if (++sinceFlush >= 25) {
+              await sink.flush();
+              sinceFlush = 0;
+              try {
+                await flushSave(fullCheck: false);
+              } catch (_) {
+                // A copy hiccup must not stop the analysis — the
+                // next flush (or the next run) copies it again.
+              }
+            }
+          }
+          processed++;
+          await onProgress(processed, photos.length, skipped, alreadyDone);
+        }
+      } finally {
+        labeler.close();
+        faceDetector.close();
+      }
+    }
+    // Final pass: copy anything left, and re-check every copy so a
+    // folder deleted mid-run is rebuilt instead of assumed saved.
+    await flushSave(fullCheck: true);
+  } finally {
+    await sink.flush();
+    await sink.close();
+  }
+
+  // Tidy the record: one line per photo, so stale lines left by
+  // moves and re-copies do not pile up. Best effort — if it fails,
+  // the appended lines already hold everything.
+  try {
+    final tmp = File('${docs.path}/sell_sorter_done.tmp');
+    final out = tmp.openWrite();
+    for (final photo in done.values) {
+      out.writeln(jsonEncode(photo.toJson()));
+    }
+    await out.flush();
+    await out.close();
+    await tmp.rename(record.path);
+    if (await oldCheckpoint.exists()) {
+      await oldCheckpoint.delete();
+    }
+  } catch (_) {}
+
+  final groups = _buildGroups(runPhotos);
+  return (
+    groups: groups,
+    skipped: skipped,
+    savePath: save ? '${docs.path}/Sell' : '',
+    alreadyDone: alreadyDone,
+  );
 }
 
 // ---------- background service ----------
@@ -638,31 +915,39 @@ class SellSorterTaskHandler extends TaskHandler {
         return;
       }
       // Every photo on the phone (the All Photos / Recents album).
+      // Each photo keeps its library id, so the done-record can
+      // recognize it again on the next run even if photo_manager
+      // hands back a different cached path for it.
       final album = albums.first;
-      final paths = <String>[];
-      final seen = <String>{};
+      final refs = <PhotoRef>[];
+      final seenKeys = <String>{};
+      final seenPaths = <String>{};
       var page = 0;
       while (true) {
         final assets = await album.getAssetListPaged(page: page, size: 300);
         if (assets.isEmpty) break;
         for (final a in assets) {
           final f = await a.file;
-          if (f != null && seen.add(f.path)) paths.add(f.path);
+          if (f == null) continue;
+          if (!seenKeys.add(a.id) || !seenPaths.add(f.path)) continue;
+          refs.add(PhotoRef(f.path, a.id));
         }
         page++;
       }
 
       var lastNotify = DateTime.fromMillisecondsSinceEpoch(0);
       final result = await runSortPipeline(
-        paths: paths,
+        photos: refs,
         save: true,
-        onProgress: (done, total, skipped) async {
+        onProgress: (done, total, skipped, alreadyDone) async {
           final now = DateTime.now();
           if (done == total ||
               now.difference(lastNotify).inMilliseconds >= 1000) {
             lastNotify = now;
-            final text =
-                'Scanning ${_withCommas(done)} / ${_withCommas(total)}';
+            final text = alreadyDone > 0
+                ? 'Scanning ${_withCommas(done)} / ${_withCommas(total)}'
+                    ' • ${_withCommas(alreadyDone)} already sorted'
+                : 'Scanning ${_withCommas(done)} / ${_withCommas(total)}';
             try {
               await FlutterForegroundTask.updateService(
                 notificationTitle: 'Sell Sorter',
@@ -675,6 +960,7 @@ class SellSorterTaskHandler extends TaskHandler {
                 'done': done,
                 'total': total,
                 'skipped': skipped,
+                'alreadyDone': alreadyDone,
               });
             } catch (_) {}
           }
@@ -685,7 +971,8 @@ class SellSorterTaskHandler extends TaskHandler {
         'groups': result.groups.map((g) => g.toJson()).toList(),
         'skipped': result.skipped,
         'savePath': result.savePath,
-        'total': paths.length,
+        'total': refs.length,
+        'alreadyDone': result.alreadyDone,
       });
     } catch (e) {
       await _sendAndStop({
@@ -750,6 +1037,7 @@ class _HomePageState extends State<HomePage> {
   int _done = 0;
   int _total = 0;
   int _skipped = 0; // Photos with people in them — not selling.
+  int _alreadyDone = 0; // Photos already sorted in an earlier run.
 
   @override
   void initState() {
@@ -811,14 +1099,17 @@ class _HomePageState extends State<HomePage> {
       final done = (map['done'] as num?)?.toInt() ?? 0;
       final total = (map['total'] as num?)?.toInt() ?? 0;
       final skipped = (map['skipped'] as num?)?.toInt() ?? 0;
+      final alreadyDone = (map['alreadyDone'] as num?)?.toInt() ?? 0;
       if (!mounted) return;
       setState(() {
         _working = true;
         _done = done;
         _total = total;
         _skipped = skipped;
-        _status =
-            'Scanning in the background: ${_withCommas(done)} / ${_withCommas(total)}…';
+        _alreadyDone = alreadyDone;
+        _status = alreadyDone > 0
+            ? 'Scanning in the background: ${_withCommas(done)} / ${_withCommas(total)}… ${_withCommas(alreadyDone)} already sorted.'
+            : 'Scanning in the background: ${_withCommas(done)} / ${_withCommas(total)}…';
       });
       return;
     }
@@ -827,13 +1118,16 @@ class _HomePageState extends State<HomePage> {
           .map((g) => GroupData.fromJson((g as Map).cast<String, dynamic>()))
           .toList();
       final skipped = (map['skipped'] as num?)?.toInt() ?? 0;
+      final alreadyDone = (map['alreadyDone'] as num?)?.toInt() ?? 0;
       final savePath = map['savePath'] as String? ?? '';
       if (!mounted) return;
       setState(() {
         _groups = groups.map(_groupDataToItemGroup).toList();
         _working = false;
+        _alreadyDone = alreadyDone;
         _status =
             '${_groups.length} selling folders, $skipped family photos skipped. '
+            '${alreadyDone > 0 ? '$alreadyDone were already sorted in earlier runs. ' : ''}'
             'Saved to $savePath. Check names, then tap Save folders again if you changed any.';
       });
       return;
@@ -1009,6 +1303,7 @@ class _HomePageState extends State<HomePage> {
         _working = true;
         _done = 0;
         _total = 0;
+        _alreadyDone = 0;
         _status =
             'Scan running in the background — you can lock the phone or use other apps. Open the app any time to see progress.';
       });
@@ -1064,14 +1359,15 @@ class _HomePageState extends State<HomePage> {
       _working = true;
       _done = 0;
       _skipped = 0;
+      _alreadyDone = 0;
       _total = _picked.length;
       _status = 'Sorting ${_picked.length} photos...';
     });
     var lastUiUpdate = DateTime.fromMillisecondsSinceEpoch(0);
     final result = await runSortPipeline(
-      paths: _picked.map((f) => f.path).toList(),
+      photos: _picked.map((f) => PhotoRef(f.path)).toList(),
       save: false,
-      onProgress: (done, total, skipped) async {
+      onProgress: (done, total, skipped, alreadyDone) async {
         final now = DateTime.now();
         if (done == total ||
             now.difference(lastUiUpdate).inMilliseconds >= 500) {
@@ -1081,6 +1377,7 @@ class _HomePageState extends State<HomePage> {
               _done = done;
               _total = total;
               _skipped = skipped;
+              _alreadyDone = alreadyDone;
             });
           }
         }
@@ -1091,6 +1388,7 @@ class _HomePageState extends State<HomePage> {
       _groups = result.groups.map(_groupDataToItemGroup).toList();
       _working = false;
       _status = '${_groups.length} selling folders, ${result.skipped} family photos skipped. '
+          '${result.alreadyDone > 0 ? '${result.alreadyDone} were already sorted in earlier runs. ' : ''}'
           'Check names, fix anything wrong, then Save folders.';
     });
   }
