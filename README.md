@@ -14,8 +14,10 @@ only copies.
    save) in the background. A notification shows live progress
    ("Scanning 1,234 / 8,000"). You can lock the phone, use other
    apps, or close the app — the scan keeps going. Open the app any
-   time to see the same progress. If a run gets interrupted it
-   resumes where it stopped instead of starting over.
+   time to see the same progress. It saves as it goes: the folders
+   build up in the `Sell` folder while it scans, so if a run gets
+   interrupted nothing is lost and the next run picks up where it
+   stopped instead of starting over.
 2. **Sort photos** — on-device ML Kit (nothing is sent anywhere):
    - Face detection + person labels: a photo with people in it is a family
      photo, not a selling photo. It is skipped and gets no folder.
@@ -29,6 +31,25 @@ only copies.
    another folder. What you set stays set.
 4. **Save folders** — copies everything into the app's `Sell` folder:
    `Sell/<Item>/` for good shots, `Sell/<Item>/Poor/` for the poor ones.
+
+## It saves as it goes — it never starts over
+
+- Every photo the app finishes is written down in a list it keeps on
+  the phone. That list is never deleted.
+- The next time you tap **Scan all photos**, it reads the list and
+  skips every photo already on it — the notification says how many it
+  skipped ("Scanning 3,000 / 8,000 • 5,000 already sorted"), so you
+  can see it is not starting over.
+- As each photo is sorted, its copy goes into its Sell folder right
+  away (in small batches). If the phone dies or the app stops, the
+  folders it already built are still there.
+- If you delete a copy out of a Sell folder, the next run puts it
+  back — it does not re-scan the photo, it just copies it again.
+- Photos you pick by hand (Pick photos / Pick a phone folder) use the
+  same list, so a photo sorted by hand is skipped by the next full
+  scan too. Reviewing first (Sort photos, then Save folders) still
+  works the same way — the folders are only saved when you tap Save
+  folders.
 
 ## What it cannot do (the honest limits)
 
